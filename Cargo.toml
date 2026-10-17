@@ -1,0 +1,53 @@
+[package]
+name = "catzprint"
+version = "2.1.3"
+edition = "2021"
+description = "Official Rust SDK for the CatzPrint cloud printing API"
+license = "MIT"
+authors = ["Catalizo"]
+repository = "https://github.com/Catalizo/catzprint-rust"
+homepage = "https://catzprint.com"
+documentation = "https://docs.rs/catzprint"
+readme = "README.md"
+keywords = ["printing", "receipt", "escpos", "api", "sdk"]
+categories = ["api-bindings", "web-programming::http-client"]
+include = ["src/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE", "Cargo.toml"]
+
+[features]
+default = ["sealed"]
+## Client-side sealing (NaCl sealed box) of job content to the server key.
+sealed = ["dep:crypto_box"]
+## A synchronous client built on reqwest::blocking.
+blocking = ["reqwest/blocking"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+fastrand = "2"
+crypto_box = { version = "0.9", features = ["seal"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "print_receipt"
+
+[[example]]
+name = "print_pdf_and_wait"
+
+[[example]]
+name = "verify_webhook"
