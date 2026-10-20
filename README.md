@@ -108,6 +108,9 @@ Use `.kind("escpos")` to send raw ESC/POS bytes, or `.kind("test")` with no cont
 
 ### Helpers
 
+Printer names aren't unique (two stations can each have a "Kitchen"), so target printers by ID. `client.printers().list()` returns each printer's `id`, `station_id`, `station_name`, `location_id` and `role`. Optional shortcut: in the CatzPrint console, open **Locations & stations** (**My devices** in a personal account), then a station, and click the ID under a printer's name to copy it.
+
+
 ```rust
 use catzprint::{Command, Column, CreateJob};
 use serde_json::json;
