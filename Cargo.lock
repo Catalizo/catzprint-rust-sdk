@@ -83,22 +83,28 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "catzprint"
-version = "2.1.3"
+version = "2.2.1"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "crypto_box",
+ "curve25519-dalek",
  "fastrand",
  "hex",
  "hmac",
+ "http-body",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

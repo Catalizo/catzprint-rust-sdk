@@ -24,6 +24,8 @@
 //! ## Features
 //! - `sealed` (default): client-side NaCl sealed-box encryption of job content
 //!   ([`CreateJob::sealed`]).
+//! - `local` (default): local (offline) printing through CatzPrint stations
+//!   on the same network ([`ClientBuilder::local`], [`LocalConfig`]).
 //! - `blocking`: a synchronous client in the `blocking` module.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
@@ -32,6 +34,8 @@
 mod client;
 mod core;
 mod error;
+#[cfg(feature = "local")]
+mod local;
 mod models;
 mod params;
 mod seal;
@@ -43,9 +47,17 @@ pub mod blocking;
 
 pub use crate::client::{Client, JobIter, Jobs, Locations, Printers, Templates};
 pub use crate::core::{ClientBuilder, DEFAULT_BASE_URL, USER_AGENT};
-pub use crate::error::{ApiError, Error, Result};
+pub use crate::error::{ApiError, Error, Result, StationAttempt, OUTCOME_UNKNOWN_MESSAGE};
+#[cfg(feature = "local")]
+#[cfg_attr(docsrs, doc(cfg(feature = "local")))]
+pub use crate::local::{
+    FileTokenStore, Local, LocalAllowance, LocalConfig, LocalEndpoint, LocalEndpoints, LocalInfo,
+    LocalJob, LocalMode, LocalPairing, LocalPrinterStatus, LocalStation, LocalStationState,
+    LocalStatus, LocalToken, LocalTokenParams, LocalTokens, MemoryTokenStore, StoreFuture,
+    StoredToken, TokenStore,
+};
 pub use crate::models::{
-    Job, JobEvent, JobPage, JobStatus, Key, Location, Printer, Template, WebhookEvent,
+    Job, JobEvent, JobPage, JobStatus, Key, Location, Printer, Template, Via, WebhookEvent,
 };
 pub use crate::params::{Column, Command, Content, CreateJob, ListJobs, Reprint, WaitOptions};
 #[cfg(feature = "sealed")]

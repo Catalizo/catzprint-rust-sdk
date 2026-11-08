@@ -25,7 +25,8 @@ use serde_json::{json, Value};
 use crate::client::read_file;
 use crate::core::{
     decide, field, job_with_events, list_field, parse_retry_after, seg, whole, with_idempotency,
-    Attempt, ClientBuilder, Config, Method, Request, Step, MAX_RESPONSE_BYTES, USER_AGENT,
+    Attempt, ClientBuilder, CloudModeCreate, CloudNext, Config, Method, Request, Step,
+    DUPLICATE_PAUSE, MAX_RESPONSE_BYTES, USER_AGENT,
 };
 use crate::error::{Error, Result};
 use crate::models::{Job, JobPage, Key, Location, Printer, Template};
@@ -98,15 +99,17 @@ impl Client {
         Ok(self.key()?.org_id)
     }
 
-    /// The server's X25519 public key for sealed content (cached).
+    /// The server's X25519 public key for sealed content (cached for an hour;
+    /// dropped when the API can't decrypt a sealed job).
     pub fn server_key(&self) -> Result<[u8; 32]> {
         if let Some(k) = self.cfg.cached_server_key() {
             return Ok(k);
         }
+        let gen = self.cfg.server_key_gen();
         let v = self.send(Request::get("/v1/public/server-key").public())?;
         let b64: String = field(v, "public_key")?;
         let k = seal::decode_public_key(&b64)?;
-        self.cfg.set_server_key(k);
+        self.cfg.set_server_key(k, gen);
         Ok(k)
     }
 
@@ -146,6 +149,7 @@ impl Client {
             let mut rb = match req.method {
                 Method::Get => self.http.get(url),
                 Method::Post => self.http.post(url),
+                Method::Delete => self.http.delete(url),
             }
             .header(ACCEPT, "application/json")
             .header(UA, USER_AGENT);
@@ -158,6 +162,8 @@ impl Client {
             if let Some(b) = &req.body {
                 rb = rb.json(b);
             }
+            // Whether a failed attempt may have reached the API.
+            let mut maybe_sent = false;
             let outcome = match rb.send() {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
@@ -173,23 +179,30 @@ impl Client {
                             body,
                         },
                         Ok(None) => Attempt::TooLarge,
-                        Err(e) => Attempt::Network {
-                            timeout: e
-                                .get_ref()
-                                .and_then(|i| i.downcast_ref::<reqwest::Error>())
-                                .is_some_and(|r| r.is_timeout()),
-                            message: e.to_string(),
-                        },
+                        Err(e) => {
+                            maybe_sent = true;
+                            Attempt::Network {
+                                timeout: e
+                                    .get_ref()
+                                    .and_then(|i| i.downcast_ref::<reqwest::Error>())
+                                    .is_some_and(|r| r.is_timeout()),
+                                message: e.to_string(),
+                            }
+                        }
                     }
                 }
-                Err(e) => Attempt::Network {
-                    message: e.to_string(),
-                    timeout: e.is_timeout(),
-                },
+                Err(e) => {
+                    maybe_sent = !e.is_connect();
+                    Attempt::Network {
+                        message: e.to_string(),
+                        timeout: e.is_timeout(),
+                    }
+                }
             };
             match decide(&self.cfg, req, attempt, outcome) {
                 Step::Done(r) => return r,
                 Step::Retry(wait) => {
+                    req.note_retry(maybe_sent);
                     std::thread::sleep(wait);
                     attempt += 1;
                 }
@@ -225,19 +238,50 @@ pub struct Jobs<'a> {
 impl<'a> Jobs<'a> {
     /// Creates a print job. See [`crate::Jobs::create`].
     pub fn create(&self, params: CreateJob) -> Result<Job> {
-        let params = with_idempotency(params);
-        let key = if params.sealed {
-            Some(self.client.server_key()?)
-        } else {
-            None
+        let params = with_idempotency(params)?;
+        let body = |params: &CreateJob| -> Result<Value> {
+            let key = if params.sealed {
+                Some(self.client.server_key()?)
+            } else {
+                None
+            };
+            let sealer = key.map(|k| move |m: &[u8]| seal::seal(&k, m));
+            params.to_body(sealer.as_ref().map(|f| f as Sealer<'_>))
         };
-        let sealer = key.map(|k| move |m: &[u8]| seal::seal(&k, m));
-        let body = params.to_body(sealer.as_ref().map(|f| f as Sealer<'_>))?;
-        field(
-            self.client
-                .send(Request::post("/v1/orgs/{org}/jobs", body).idempotent())?,
-            "job",
-        )
+        let mut st = CloudModeCreate::new(
+            params.sealed,
+            &self.client.cfg.base_url,
+            params.idempotency_key.as_deref().unwrap_or_default(),
+        );
+        let amb = st.ambiguous.clone();
+        let request = move |b: Value| {
+            Request::post("/v1/orgs/{org}/jobs", b)
+                .idempotent()
+                .track_ambiguous(amb.clone())
+        };
+        // Built (and sealed) once: retries and re-sends send the same bytes.
+        let mut req = request(body(&params)?);
+        let v = loop {
+            let err = match self.client.send(req.clone()) {
+                Ok(v) => break v,
+                Err(e) => e,
+            };
+            match st.after(err) {
+                // 409 duplicate: the key's job is being created; ask again.
+                CloudNext::Resend => std::thread::sleep(DUPLICATE_PAUSE),
+                CloudNext::Reseal(first) => {
+                    // The server key was rotated: fetch it again, seal again,
+                    // re-send once with the same idempotency key (S1).
+                    self.client.cfg.drop_server_key();
+                    match body(&params) {
+                        Ok(b) => req = request(b),
+                        Err(fe) => return Err(st.key_fetch_failed(first, fe)),
+                    }
+                }
+                CloudNext::Fail(e) => return Err(e),
+            }
+        };
+        field(v, "job")
     }
 
     /// Prints plain text.

@@ -1,8 +1,9 @@
 //! Transport-independent pieces shared by the async and blocking clients:
 //! configuration, request descriptions, retry policy and response decoding.
 
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -28,6 +29,8 @@ pub const USER_AGENT: &str = concat!("catzprint-rust/", env!("CARGO_PKG_VERSION"
 /// ```
 #[derive(Clone)]
 pub struct ClientBuilder {
+    #[cfg(feature = "local")]
+    local: Option<crate::local::LocalConfig>,
     api_key: Option<String>,
     base_url: Option<String>,
     org_id: Option<String>,
@@ -40,6 +43,8 @@ pub struct ClientBuilder {
 impl Default for ClientBuilder {
     fn default() -> Self {
         ClientBuilder {
+            #[cfg(feature = "local")]
+            local: None,
             api_key: None,
             base_url: None,
             org_id: None,
@@ -59,11 +64,20 @@ impl std::fmt::Debug for ClientBuilder {
             .field("org_id", &self.org_id)
             .field("timeout", &self.timeout)
             .field("max_retries", &self.max_retries)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl ClientBuilder {
+    /// Enables local printing through CatzPrint stations on the same network
+    /// (feature `local`). See [`crate::LocalConfig`] and the README section
+    /// "Local printing (offline)".
+    #[cfg(feature = "local")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "local")))]
+    pub fn local(mut self, config: crate::local::LocalConfig) -> Self {
+        self.local = Some(config);
+        self
+    }
     /// The API key (`cz_live_…` or `cz_test_…`). Defaults to `$CATZPRINT_API_KEY`.
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
@@ -105,22 +119,59 @@ impl ClientBuilder {
 
     /// Builds the async client.
     pub fn build(self) -> Result<crate::Client> {
-        crate::Client::from_config(self.into_config()?)
+        #[cfg(feature = "local")]
+        let local = self.local.clone();
+        #[cfg(feature = "local")]
+        let paired = local.as_ref().is_some_and(|l| l.is_paired_device());
+        #[cfg(not(feature = "local"))]
+        let paired = false;
+        let cfg = self.into_config_with(paired)?;
+        #[cfg(feature = "local")]
+        {
+            crate::Client::from_config_local(cfg, local)
+        }
+        #[cfg(not(feature = "local"))]
+        {
+            crate::Client::from_config(cfg)
+        }
     }
 
-    /// Builds the blocking client.
+    /// Builds the blocking client. Local printing needs the async client.
     #[cfg(feature = "blocking")]
     pub fn build_blocking(self) -> Result<crate::blocking::Client> {
+        #[cfg(feature = "local")]
+        if self.local.as_ref().is_some_and(|l| l.is_local_mode()) {
+            return Err(Error::Config(
+                "local printing is only available on the async client".into(),
+            ));
+        }
         crate::blocking::Client::from_config(self.into_config()?)
     }
 
+    #[cfg(any(feature = "blocking", test))]
     pub(crate) fn into_config(self) -> Result<Config> {
+        self.into_config_with(false)
+    }
+
+    /// `allow_no_key`: a paired device in local mode (static device token)
+    /// needs no API key; its cloud calls fail with `missing_api_key`.
+    fn into_config_with(self, allow_no_key: bool) -> Result<Config> {
         let api_key = self
             .api_key
             .or_else(|| std::env::var("CATZPRINT_API_KEY").ok())
             .map(|k| k.trim().to_string())
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| Error::Config("no API key: pass one or set CATZPRINT_API_KEY".into()))?;
+            .filter(|k| !k.is_empty());
+        let api_key = match api_key {
+            Some(k) => k,
+            None if allow_no_key => String::new(),
+            None => {
+                return Err(Error::Config(
+                    "no API key: pass one or set CATZPRINT_API_KEY (only a paired device in \
+                     local mode, with LocalMode::Local and a token, can work without one)"
+                        .into(),
+                ))
+            }
+        };
         let base_url = self
             .base_url
             .or_else(|| {
@@ -135,7 +186,7 @@ impl ClientBuilder {
             api_key,
             base_url,
             org_id: Mutex::new(self.org_id),
-            server_key: Mutex::new(None),
+            server_key: Mutex::new(ServerKeyCache::default()),
             timeout: self.timeout,
             max_retries: self.max_retries,
             retry_base_delay: self.retry_base_delay,
@@ -200,11 +251,19 @@ pub(crate) fn redact(key: &str) -> String {
     format!("{prefix}****{tail}")
 }
 
+/// The cached server key and a generation counter bumped on every drop.
+#[derive(Default)]
+pub(crate) struct ServerKeyCache {
+    pub key: Option<([u8; 32], Instant)>,
+    pub gen: u64,
+}
+
 pub(crate) struct Config {
     pub api_key: String,
     pub base_url: String,
     pub org_id: Mutex<Option<String>>,
-    pub server_key: Mutex<Option<[u8; 32]>>,
+    /// The server key and when it was fetched (used for [`SERVER_KEY_TTL`]).
+    pub server_key: Mutex<ServerKeyCache>,
     pub timeout: Duration,
     pub max_retries: u32,
     pub retry_base_delay: Duration,
@@ -236,11 +295,50 @@ impl Config {
     pub fn set_org(&self, org: &str) {
         *self.org_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(org.to_string());
     }
+    /// The cached server key, while it is younger than [`SERVER_KEY_TTL`].
     pub fn cached_server_key(&self) -> Option<[u8; 32]> {
-        *self.server_key.lock().unwrap_or_else(|e| e.into_inner())
+        self.server_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .key
+            .filter(|(_, at)| at.elapsed() < SERVER_KEY_TTL)
+            .map(|(k, _)| k)
     }
-    pub fn set_server_key(&self, k: [u8; 32]) {
-        *self.server_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(k);
+    /// The current generation, to pass to [`Config::set_server_key`] when a
+    /// fetch completes.
+    pub fn server_key_gen(&self) -> u64 {
+        self.server_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .gen
+    }
+    /// Caches a fetched key, unless the key was dropped since the fetch
+    /// started (`gen` is the generation read before fetching): an older
+    /// in-flight fetch must not bring a dropped (rotated) key back.
+    pub fn set_server_key(&self, k: [u8; 32], gen: u64) {
+        let mut c = self.server_key.lock().unwrap_or_else(|e| e.into_inner());
+        if c.gen == gen {
+            c.key = Some((k, Instant::now()));
+        }
+    }
+    /// Forgets the server key (the API couldn't decrypt a sealed job).
+    pub fn drop_server_key(&self) {
+        let mut c = self.server_key.lock().unwrap_or_else(|e| e.into_inner());
+        c.key = None;
+        c.gen += 1;
+    }
+    /// Test hook: pretends the cached server key was fetched `age` ago.
+    #[cfg(test)]
+    pub fn age_server_key(&self, age: Duration) {
+        if let Some((_, at)) = self
+            .server_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .key
+            .as_mut()
+        {
+            *at = at.checked_sub(age).unwrap_or(*at);
+        }
     }
 
     /// The wait before retry number `attempt` (0-based): exponential backoff
@@ -263,6 +361,8 @@ impl Config {
 pub(crate) enum Method {
     Get,
     Post,
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    Delete,
 }
 
 /// A request to make, independent of the transport.
@@ -277,6 +377,14 @@ pub(crate) struct Request {
     pub idempotent: bool,
     /// Whether to send the API key.
     pub auth: bool,
+    /// Overrides the client's retry count (local printing: the cloud is
+    /// tried once before falling back).
+    pub max_retries: Option<u32>,
+    /// Overrides the client's per-request timeout.
+    pub timeout: Option<Duration>,
+    /// Set when an attempt that may have reached the API (sent, then no
+    /// usable answer) was retried.
+    pub ambiguous: Option<Arc<AtomicBool>>,
 }
 
 impl Request {
@@ -288,6 +396,9 @@ impl Request {
             body: None,
             idempotent: false,
             auth: true,
+            max_retries: None,
+            timeout: None,
+            ambiguous: None,
         }
     }
     pub fn post(path: impl Into<String>, body: Value) -> Self {
@@ -298,7 +409,24 @@ impl Request {
             body: Some(body),
             idempotent: false,
             auth: true,
+            max_retries: None,
+            timeout: None,
+            ambiguous: None,
         }
+    }
+    #[cfg(feature = "local")]
+    pub fn delete(path: impl Into<String>) -> Self {
+        Request {
+            method: Method::Delete,
+            ..Request::get(path)
+        }
+    }
+    /// Tries once, within `timeout` (local printing's cloud calls).
+    #[cfg(feature = "local")]
+    pub fn once_within(mut self, timeout: Duration) -> Self {
+        self.max_retries = Some(0);
+        self.timeout = Some(timeout);
+        self
     }
     pub fn query(mut self, q: Vec<(String, String)>) -> Self {
         self.query = q;
@@ -312,11 +440,26 @@ impl Request {
         self.auth = false;
         self
     }
+    /// Records retries after attempts that may have reached the API in `flag`.
+    pub fn track_ambiguous(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.ambiguous = Some(flag);
+        self
+    }
+    /// Called before a retry: `maybe_sent` says the failed attempt may have
+    /// reached the API.
+    pub fn note_retry(&self, maybe_sent: bool) {
+        if let (true, Some(f)) = (maybe_sent, &self.ambiguous) {
+            f.store(true, Ordering::SeqCst);
+        }
+    }
     pub fn needs_org(&self) -> bool {
         self.path.contains("{org}")
     }
     pub fn retryable(&self) -> bool {
         self.method == Method::Get || self.idempotent
+    }
+    pub fn max_retries(&self, cfg: &Config) -> u32 {
+        self.max_retries.unwrap_or(cfg.max_retries)
     }
     pub fn url(&self, base: &str, org: Option<&str>) -> String {
         match org {
@@ -361,7 +504,7 @@ pub(crate) enum Attempt {
 
 /// Applies the retry policy to one attempt.
 pub(crate) fn decide(cfg: &Config, req: &Request, attempt: u32, outcome: Attempt) -> Step {
-    let can_retry = req.retryable() && attempt < cfg.max_retries;
+    let can_retry = req.retryable() && attempt < req.max_retries(cfg);
     match outcome {
         Attempt::TooLarge => Step::Done(Err(Error::Decode(format!(
             "the API response is larger than {MAX_RESPONSE_BYTES} bytes"
@@ -443,15 +586,168 @@ pub(crate) fn job_with_events(mut v: Value) -> Result<crate::Job> {
     Ok(job)
 }
 
-/// Fills in a generated idempotency key.
-pub(crate) fn with_idempotency(mut p: crate::CreateJob) -> crate::CreateJob {
-    if p.idempotency_key
-        .as_deref()
-        .is_none_or(|k| k.trim().is_empty())
-    {
+/// The error of a cloud call made by a client without an API key (a paired
+/// device in local mode).
+pub(crate) fn missing_api_key() -> Error {
+    Error::Authentication(crate::ApiError {
+        status: 401,
+        code: "missing_api_key".into(),
+        message: "This client has no API key (a paired device in local mode), so it can't call \
+                  the CatzPrint API."
+            .into(),
+        fields: Default::default(),
+        retry_after: None,
+    })
+}
+
+/// Checks the caller's idempotency key: a key that is empty after trimming
+/// whitespace counts as no key (`None`); a key with leading or trailing
+/// whitespace or control characters is refused rather than silently changed
+/// (a changed key would no longer dedupe against the caller's own retries).
+pub(crate) fn normalize_idempotency_key(p: &mut crate::CreateJob) -> Result<()> {
+    let Some(k) = p.idempotency_key.as_deref() else {
+        return Ok(());
+    };
+    if k.trim().is_empty() {
+        p.idempotency_key = None;
+        return Ok(());
+    }
+    let why = if k.trim() != k {
+        "Can't start or end with whitespace."
+    } else if k.chars().any(char::is_control) {
+        "Can't contain control characters."
+    } else {
+        return Ok(());
+    };
+    // 422 like the SDK's other client-side validation errors.
+    Err(Error::Validation(crate::ApiError {
+        status: 422,
+        code: "invalid".into(),
+        message: format!("The idempotency key is invalid: {why}"),
+        fields: [("idempotency_key".to_string(), why.to_string())]
+            .into_iter()
+            .collect(),
+        retry_after: None,
+    }))
+}
+
+/// A `409 duplicate` to a job create: the idempotency key's job is being
+/// created by a concurrent or earlier request (or belongs to another job).
+/// The SDK waits [`DUPLICATE_PAUSE`] and re-sends the identical request, at
+/// most [`DUPLICATE_RESENDS`] times, so it gets that job.
+pub(crate) fn is_duplicate(e: &Error) -> bool {
+    matches!(e, Error::Conflict(a) if a.code == "duplicate")
+}
+
+/// How long a fetched server key is used before it is fetched again (the
+/// server may rotate it).
+pub(crate) const SERVER_KEY_TTL: Duration = Duration::from_secs(3600);
+
+/// A 400/422 saying the API couldn't use `sealed_content` (usually: the
+/// server key was rotated after the SDK fetched it).
+pub(crate) fn sealed_rejected(e: &Error) -> bool {
+    matches!(e, Error::Validation(a) if a.fields.contains_key("sealed_content"))
+}
+
+/// An error after which the API may have the job (a network error, a 5xx
+/// other than 502/503/504, a redirect, an unreadable answer).
+pub(crate) fn maybe_arrived(e: &Error) -> bool {
+    match e {
+        Error::Connection { .. } | Error::Decode(_) => true,
+        Error::Server(a) => !matches!(a.status, 502..=504),
+        Error::Api(a) => (300..400).contains(&a.status),
+        _ => false,
+    }
+}
+
+/// What the cloud-mode create does after an error: re-send after a
+/// `409 duplicate` (R4), re-seal once after a `sealed_content` 400 (S1), or
+/// fail.
+pub(crate) enum CloudNext {
+    Resend,
+    /// Carries the API's `sealed_content` answer (returned when the key
+    /// can't be fetched again and nothing was ambiguous).
+    Reseal(Error),
+    Fail(Error),
+}
+
+/// The state of one cloud-mode create (shared by the async and blocking
+/// clients).
+pub(crate) struct CloudModeCreate {
+    pub sealed: bool,
+    pub resends: u32,
+    pub resealed: bool,
+    /// An attempt may have reached the API (set by the HTTP retry loop).
+    pub ambiguous: Arc<AtomicBool>,
+    pub base_url: String,
+    pub key: String,
+}
+
+impl CloudModeCreate {
+    pub fn new(sealed: bool, base_url: &str, key: &str) -> Self {
+        CloudModeCreate {
+            sealed,
+            resends: 0,
+            resealed: false,
+            ambiguous: Arc::new(AtomicBool::new(false)),
+            base_url: base_url.to_string(),
+            key: key.to_string(),
+        }
+    }
+    pub fn ambiguous(&self) -> bool {
+        self.ambiguous.load(Ordering::SeqCst)
+    }
+    pub fn unknown(&self, e: Error) -> Error {
+        Error::OutcomeUnknown {
+            url: self.base_url.clone(),
+            idempotency_key: self.key.clone(),
+            cause: Box::new(e),
+        }
+    }
+    pub fn after(&mut self, e: Error) -> CloudNext {
+        if is_duplicate(&e) && self.resends < DUPLICATE_RESENDS {
+            self.resends += 1;
+            return CloudNext::Resend;
+        }
+        if self.sealed && sealed_rejected(&e) {
+            if self.resends > 0 {
+                // A job with this key exists or is being created.
+                return CloudNext::Fail(self.unknown(e));
+            }
+            if !self.resealed {
+                self.resealed = true;
+                return CloudNext::Reseal(e);
+            }
+            return CloudNext::Fail(if self.ambiguous() { self.unknown(e) } else { e });
+        }
+        if self.resealed && !is_duplicate(&e) && (self.ambiguous() || maybe_arrived(&e)) {
+            // After an ambiguous attempt only the job (or a 409) settles it.
+            return CloudNext::Fail(self.unknown(e));
+        }
+        CloudNext::Fail(e)
+    }
+    /// The re-seal's key fetch failed: nothing more was sent.
+    pub fn key_fetch_failed(&self, first: Error, fetch: Error) -> Error {
+        if self.ambiguous() {
+            self.unknown(fetch)
+        } else {
+            first
+        }
+    }
+}
+
+/// `409 duplicate` re-sends: at most this many, this far apart.
+pub(crate) const DUPLICATE_RESENDS: u32 = 3;
+pub(crate) const DUPLICATE_PAUSE: Duration = Duration::from_secs(1);
+
+/// Checks the idempotency key and fills in a generated one when there is
+/// none.
+pub(crate) fn with_idempotency(mut p: crate::CreateJob) -> Result<crate::CreateJob> {
+    normalize_idempotency_key(&mut p)?;
+    if p.idempotency_key.is_none() {
         p.idempotency_key = Some(uuid::Uuid::new_v4().to_string());
     }
-    p
+    Ok(p)
 }
 
 /// The file name of a path, used as the job file name and default title.
@@ -573,5 +869,39 @@ mod tests {
             Request::get("/v1/orgs/{org}/jobs").url("http://h", Some("o1")),
             "http://h/v1/orgs/o1/jobs"
         );
+    }
+
+    /// S2 (addendum 5): the server key is used for an hour, then fetched
+    /// again; a sealed_content 400 drops it at once.
+    #[test]
+    fn server_key_cache_expires_after_an_hour() {
+        let cfg = ClientBuilder::default()
+            .api_key("cz_test_x")
+            .into_config()
+            .unwrap();
+        cfg.set_server_key([9; 32], cfg.server_key_gen());
+        assert_eq!(cfg.cached_server_key(), Some([9; 32]));
+        cfg.age_server_key(Duration::from_secs(59 * 60));
+        assert!(cfg.cached_server_key().is_some());
+        cfg.age_server_key(Duration::from_secs(2 * 60));
+        assert_eq!(cfg.cached_server_key(), None, "stale after an hour");
+        cfg.set_server_key([9; 32], cfg.server_key_gen());
+        cfg.drop_server_key();
+        assert_eq!(cfg.cached_server_key(), None);
+    }
+
+    /// SDK9-2: a fetch that started before a drop doesn't re-install its key.
+    #[test]
+    fn stale_server_key_fetch_is_not_reinstalled() {
+        let cfg = ClientBuilder::default()
+            .api_key("cz_test_x")
+            .into_config()
+            .unwrap();
+        let gen = cfg.server_key_gen(); // a fetch starts
+        cfg.drop_server_key(); // a sealed_content rejection lands meanwhile
+        cfg.set_server_key([9; 32], gen); // the old fetch completes
+        assert_eq!(cfg.cached_server_key(), None, "the dropped key came back");
+        cfg.set_server_key([7; 32], cfg.server_key_gen());
+        assert_eq!(cfg.cached_server_key(), Some([7; 32]));
     }
 }

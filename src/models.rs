@@ -115,9 +115,76 @@ pub struct Job {
     pub printed_at: Option<DateTime<Utc>>,
     /// When it reached a final status.
     pub finished_at: Option<DateTime<Utc>>,
+    /// `true` when a station printed the job through its local API (directly,
+    /// or reported later by reconciliation).
+    pub printed_locally: bool,
+    /// The name of the device that sent a local job.
+    pub local_device: Option<String>,
+    /// Set on a job recorded by reconciliation when another job with the same
+    /// idempotency key had already printed elsewhere.
+    pub duplicate_of: Option<String>,
+    /// In webhook payloads: `true` when the station had no cloud connection
+    /// when it printed.
+    #[serde(skip_serializing_if = "is_false")]
+    pub offline: bool,
+    /// The job's idempotency key, when the API or station reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Set by the SDK: [`Via::Local`] when a station on the local network took
+    /// the job, [`Via::Cloud`] when the CatzPrint API did. `Jobs::create` and
+    /// `Jobs::get` fill it; `None` elsewhere (lists, webhooks).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_via"
+    )]
+    pub via: Option<Via>,
+    /// The station's own view of a local job (`via == Some(Via::Local)`).
+    #[cfg(feature = "local")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "local")))]
+    #[serde(skip)]
+    pub local: Option<crate::local::LocalJob>,
     /// Status history; only filled by [`crate::Jobs::get`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<JobEvent>,
+}
+
+fn lenient_via<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Via>, D::Error> {
+    let s: Option<String> = Option::deserialize(d)?;
+    Ok(match s.as_deref() {
+        Some("cloud") => Some(Via::Cloud),
+        Some("local") => Some(Via::Local),
+        _ => None,
+    })
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Where a job was sent ([`Job::via`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    /// The CatzPrint API took the job.
+    Cloud,
+    /// A CatzPrint station on the local network took the job.
+    Local,
+}
+
+impl Via {
+    /// `"cloud"` or `"local"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Via::Cloud => "cloud",
+            Via::Local => "local",
+        }
+    }
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// One entry of a job's status history.

@@ -27,9 +27,32 @@ pub(crate) fn decode_public_key(b64: &str) -> Result<[u8; 32]> {
 /// `SealedBox`).
 #[cfg(feature = "sealed")]
 pub fn seal(public_key: &[u8; 32], message: &[u8]) -> Result<Vec<u8>> {
+    if small_order(public_key) {
+        return Err(Error::Sealing(
+            "the public key is a small-order X25519 point (the shared secret would be all \
+             zeros, so anyone could open the box)"
+                .into(),
+        ));
+    }
     let pk = crypto_box::PublicKey::from(*public_key);
     pk.seal(&mut crypto_box::aead::OsRng, message)
         .map_err(|_| Error::Sealing("encryption failed".into()))
+}
+
+/// Whether X25519 with this public key gives an all-zero shared secret.
+///
+/// Every clamped scalar is a multiple of the cofactor 8 and never a multiple
+/// of the prime order, so the shared secret is all zeros for one clamped
+/// scalar exactly when it is for all of them (the ephemeral one included):
+/// when the key has small order (on the curve or its twist).
+#[cfg(feature = "sealed")]
+fn small_order(public_key: &[u8; 32]) -> bool {
+    let probe = [0x5a; 32]; // any scalar: mul_clamped clamps it
+    let shared = curve25519_dalek::montgomery::MontgomeryPoint(*public_key).mul_clamped(probe);
+    bool::from(subtle::ConstantTimeEq::ct_eq(
+        shared.as_bytes().as_slice(),
+        [0u8; 32].as_slice(),
+    ))
 }
 
 /// Seals `message` to a base64 public key. See [`seal`].
@@ -57,6 +80,34 @@ mod tests {
         let sealed = seal(&pk, b"hello").unwrap();
         assert_eq!(sealed.len(), 32 + 5 + 16);
         assert_eq!(sk.unseal(&sealed).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn rejects_small_order_keys() {
+        // The small-order points of Curve25519 (and their non-canonical
+        // encodings), as listed by libsodium.
+        let hex_points = [
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ];
+        for h in hex_points {
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&hex::decode(h).unwrap());
+            assert!(
+                matches!(seal(&pk, b"secret"), Err(Error::Sealing(_))),
+                "{h}"
+            );
+        }
+        // Real keys still work.
+        for _ in 0..32 {
+            let sk = crypto_box::SecretKey::generate(&mut crypto_box::aead::OsRng);
+            assert!(seal(sk.public_key().as_bytes(), b"x").is_ok());
+        }
     }
 
     #[test]

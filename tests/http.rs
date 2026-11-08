@@ -53,7 +53,7 @@ async fn sends_auth_user_agent_and_looks_up_org_once() {
         reqs[1].headers["authorization"],
         "Bearer cz_test_abcdefghijklmnopqrstuvwxyz"
     );
-    assert_eq!(reqs[1].headers["user-agent"], "catzprint-rust/2.1.3");
+    assert_eq!(reqs[1].headers["user-agent"], "catzprint-rust/2.2.1");
     assert!(
         !format!("{c:?}").contains("abcdefghijkl"),
         "Debug must redact the key"

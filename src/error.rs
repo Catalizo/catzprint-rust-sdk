@@ -74,6 +74,12 @@ pub enum Error {
     /// 5xx: the API failed.
     #[error("server error: {0}")]
     Server(ApiError),
+    /// 503 from a CatzPrint station whose printer can't print right now:
+    /// code `printer_offline`, `out_of_paper`, `cover_open` or `printer_error`.
+    /// The job was not accepted; fix the printer and send it again (the SDK
+    /// never falls back to the cloud for these).
+    #[error("printer error: {0}")]
+    Printer(ApiError),
     /// Any other API error status (e.g. 410 `content_deleted`, 413).
     #[error("API error: {0}")]
     Api(ApiError),
@@ -108,6 +114,86 @@ pub enum Error {
     /// Reading a local file failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// No CatzPrint station on the local network could take the request:
+    /// none answered, the TLS check failed, the request timed out, a station
+    /// answered 502/504 or 503 `local_disabled`, or no local token could be
+    /// obtained. In the fallback modes `cloud_error` holds the cloud error
+    /// when the cloud failed too (it is also this error's `source()`).
+    #[error("{}", station_unreachable_message(attempts, cloud_error.as_deref()))]
+    StationUnreachable {
+        /// The stations tried, in order, and why each failed.
+        attempts: Vec<StationAttempt>,
+        /// The cloud error of a failed fallback.
+        #[source]
+        cloud_error: Option<Box<Error>>,
+    },
+    /// A station presented a certificate whose SHA-256 fingerprint (or, for a
+    /// public hostname, public-key fingerprint) isn't the pinned one. The
+    /// connection was refused during the TLS handshake: nothing was sent.
+    #[error(
+        "station {} {got} doesn't match the pinned {expected}",
+        if *spki { "public key (SPKI) fingerprint" } else { "certificate fingerprint" }
+    )]
+    PinMismatch {
+        /// The pinned fingerprint (lower-case hex).
+        expected: String,
+        /// The fingerprint the station presented (lower-case hex).
+        got: String,
+        /// `true` when the public-key pin of a public hostname failed.
+        spki: bool,
+    },
+    /// A job request reached a station (or the cloud) but no answer came
+    /// back, and asking again by idempotency key didn't settle it: the job
+    /// may or may not have printed. The SDK didn't send it anywhere else
+    /// (that could print it twice). Retrying later with the same idempotency
+    /// key is always safe: the station and the cloud dedupe on it. Code
+    /// `outcome_unknown` ([`Error::code`]).
+    #[error("{OUTCOME_UNKNOWN_MESSAGE} ({url}, idempotency key {idempotency_key}: {cause})")]
+    OutcomeUnknown {
+        /// The station URL (or the cloud API URL) the job was sent to.
+        url: String,
+        /// The job's idempotency key: retry with it.
+        idempotency_key: String,
+        /// What went wrong with the last attempt.
+        #[source]
+        cause: Box<Error>,
+    },
+}
+
+/// The message of [`Error::OutcomeUnknown`] (the same in every CatzPrint SDK).
+pub const OUTCOME_UNKNOWN_MESSAGE: &str =
+    "The station may have printed this job. Retry later with the same idempotency key.";
+
+/// One station URL the SDK tried, and why it failed
+/// ([`Error::StationUnreachable`]).
+#[derive(Debug)]
+pub struct StationAttempt {
+    /// The station URL (empty when no station was tried, e.g. no token).
+    pub url: String,
+    /// Why it failed.
+    pub error: Error,
+}
+
+fn station_unreachable_message(attempts: &[StationAttempt], cloud: Option<&Error>) -> String {
+    let mut s = String::from("no CatzPrint station could be reached");
+    if attempts.is_empty() {
+        s.push_str(" (no station address known: set station URLs or discover)");
+    }
+    for (i, a) in attempts.iter().enumerate() {
+        s.push_str(if i == 0 { ": " } else { "; " });
+        if a.url.is_empty() {
+            s.push_str("no local token (the cloud couldn't mint one): ");
+        } else {
+            s.push_str(&a.url);
+            s.push_str(": ");
+        }
+        s.push_str(&a.error.to_string());
+    }
+    if let Some(c) = cloud {
+        s.push_str("; cloud fallback failed too: ");
+        s.push_str(&c.to_string());
+    }
+    s
 }
 
 impl Error {
@@ -122,6 +208,7 @@ impl Error {
             | Error::Conflict(e)
             | Error::RateLimit(e)
             | Error::Server(e)
+            | Error::Printer(e)
             | Error::Api(e) => Some(e),
             _ => None,
         }
@@ -132,9 +219,19 @@ impl Error {
         self.api_error().map(|e| e.status)
     }
 
-    /// The API error code (e.g. `"invalid"`), when this error came from the API.
+    /// The API error code (e.g. `"invalid"`), when this error came from the
+    /// API; `"outcome_unknown"` for [`Error::OutcomeUnknown`].
     pub fn code(&self) -> Option<&str> {
+        if let Error::OutcomeUnknown { .. } = self {
+            return Some("outcome_unknown");
+        }
         self.api_error().map(|e| e.code.as_str())
+    }
+
+    /// Whether a job may or may not have printed ([`Error::OutcomeUnknown`]):
+    /// retry later with the same idempotency key.
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(self, Error::OutcomeUnknown { .. })
     }
 
     /// Per-field validation messages (empty when there are none).
@@ -147,10 +244,59 @@ impl Error {
         self.api_error().and_then(|e| e.retry_after)
     }
 
+    /// Whether no CatzPrint station could be reached
+    /// ([`Error::StationUnreachable`]).
+    pub fn is_station_unreachable(&self) -> bool {
+        matches!(self, Error::StationUnreachable { .. })
+    }
+
+    /// Whether a station refused a job because the routed printer is offline.
+    pub fn is_printer_offline(&self) -> bool {
+        self.code() == Some("printer_offline")
+    }
+
+    /// Whether a station refused (or failed) a job because the printer is out of paper.
+    pub fn is_out_of_paper(&self) -> bool {
+        self.code() == Some("out_of_paper")
+    }
+
+    /// Whether the printer's cover is open.
+    pub fn is_cover_open(&self) -> bool {
+        self.code() == Some("cover_open")
+    }
+
+    /// Whether the station has been offline too long or has used its offline
+    /// prints (`402 offline_allowance_exhausted`).
+    pub fn is_offline_allowance_exhausted(&self) -> bool {
+        self.code() == Some("offline_allowance_exhausted")
+    }
+
+    /// The stations tried, for [`Error::StationUnreachable`] (empty otherwise).
+    pub fn station_attempts(&self) -> &[StationAttempt] {
+        match self {
+            Error::StationUnreachable { attempts, .. } => attempts,
+            _ => &[],
+        }
+    }
+
+    /// The cloud error of a failed fallback, for [`Error::StationUnreachable`].
+    pub fn cloud_error(&self) -> Option<&Error> {
+        match self {
+            Error::StationUnreachable { cloud_error, .. } => cloud_error.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Builds the right error kind from an API status and error body.
     pub(crate) fn from_api(e: ApiError) -> Error {
         if e.code == "out_of_prints" || e.status == 402 {
             return Error::OutOfPrints(e);
+        }
+        if matches!(
+            e.code.as_str(),
+            "printer_offline" | "out_of_paper" | "cover_open" | "printer_error"
+        ) {
+            return Error::Printer(e);
         }
         match e.status {
             400 | 422 => Error::Validation(e),
@@ -180,6 +326,8 @@ struct ErrorBody {
     fields: BTreeMap<String, String>,
     #[serde(default)]
     retry_after_seconds: Option<u64>,
+    #[serde(default)]
+    param: Option<String>,
 }
 
 /// Maps an HTTP error answer (`{"error":{"code","message","fields","retry_after_seconds"}}`)
@@ -189,12 +337,18 @@ pub(crate) fn map_error(status: u16, retry_after_header: Option<Duration>, body:
         .ok()
         .map(|e| e.error);
     let (code, message, fields, body_retry) = match parsed {
-        Some(b) => (
-            b.code,
-            b.message,
-            b.fields,
-            b.retry_after_seconds.map(Duration::from_secs),
-        ),
+        Some(mut b) => {
+            // `{"param":"code","message":"…"}` names the one invalid field.
+            if let Some(p) = b.param.filter(|p| !p.is_empty()) {
+                b.fields.entry(p).or_insert_with(|| b.message.clone());
+            }
+            (
+                b.code,
+                b.message,
+                b.fields,
+                b.retry_after_seconds.map(Duration::from_secs),
+            )
+        }
         None => {
             let text = String::from_utf8_lossy(body)
                 .trim()
@@ -204,7 +358,11 @@ pub(crate) fn map_error(status: u16, retry_after_header: Option<Duration>, body:
             (String::new(), text, BTreeMap::new(), None)
         }
     };
-    let code = if code.is_empty() {
+    let code = if (300..400).contains(&status) {
+        // Redirects are never followed (the API key only goes to the
+        // configured host).
+        "unexpected_redirect".to_string()
+    } else if code.is_empty() {
         default_code(status).to_string()
     } else {
         code
@@ -221,6 +379,15 @@ pub(crate) fn map_error(status: u16, retry_after_header: Option<Duration>, body:
         fields,
         retry_after: body_retry.or(retry_after_header),
     })
+}
+
+/// The `code` of an error body, when it has a non-empty one.
+#[cfg(feature = "local")]
+pub(crate) fn body_code(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<ErrorEnvelope>(body)
+        .ok()
+        .map(|e| e.error.code)
+        .filter(|c| !c.is_empty())
 }
 
 fn default_code(status: u16) -> &'static str {
@@ -258,6 +425,18 @@ mod tests {
         assert!(matches!(map_error(402, None, b""), Error::OutOfPrints(_)));
         assert!(matches!(map_error(503, None, b"oops"), Error::Server(_)));
         assert!(matches!(map_error(410, None, b""), Error::Api(_)));
+        let pe = map_error(
+            503,
+            None,
+            br#"{"error":{"code":"out_of_paper","message":"Out of paper."}}"#,
+        );
+        assert!(matches!(pe, Error::Printer(_)) && pe.is_out_of_paper());
+        let inv = map_error(
+            400,
+            None,
+            br#"{"error":{"code":"invalid","message":"Bad code.","param":"code"}}"#,
+        );
+        assert_eq!(inv.fields().unwrap()["code"], "Bad code.");
         let oop = map_error(
             403,
             None,

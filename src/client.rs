@@ -10,13 +10,27 @@ use serde_json::{json, Value};
 
 use crate::core::{
     decide, field, file_name_of, job_with_events, list_field, parse_retry_after, seg, whole,
-    with_idempotency, Attempt, ClientBuilder, Config, Method, Request, Step, MAX_RESPONSE_BYTES,
-    USER_AGENT,
+    with_idempotency, Attempt, ClientBuilder, CloudModeCreate, CloudNext, Config, Method, Request,
+    Step, DUPLICATE_PAUSE, MAX_RESPONSE_BYTES, USER_AGENT,
 };
 use crate::error::{Error, Result};
 use crate::models::{Job, JobPage, Key, Location, Printer, Template};
 use crate::params::{Command, Content, CreateJob, ListJobs, Reprint, Sealer, WaitOptions};
 use crate::seal;
+
+/// One cloud create attempt in the local modes (see
+/// `Jobs::create_cloud_once`).
+#[cfg(feature = "local")]
+pub(crate) enum CloudAttempt {
+    /// The cloud answered: the job, or an error answer (4xx, 501…).
+    Answered(Result<Box<Job>>),
+    /// Certainly not delivered: connect/DNS/TLS errors, the organization
+    /// lookup failed, or 502/503/504.
+    NotDelivered(Error),
+    /// Delivered without a usable answer (timeout, reset, unreadable or
+    /// oversized answer, a redirect) or 500: the cloud may have the job.
+    Ambiguous(Error),
+}
 
 /// The async CatzPrint client. Cheap to clone; clones share the connection
 /// pool and the cached organization and server key.
@@ -31,8 +45,10 @@ use crate::seal;
 /// ```
 #[derive(Clone)]
 pub struct Client {
-    cfg: Arc<Config>,
-    http: reqwest::Client,
+    pub(crate) cfg: Arc<Config>,
+    pub(crate) http: reqwest::Client,
+    #[cfg(feature = "local")]
+    pub(crate) local: Option<Arc<crate::local::LocalHandle>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -67,7 +83,20 @@ impl Client {
         Ok(Client {
             cfg: Arc::new(cfg),
             http,
+            #[cfg(feature = "local")]
+            local: None,
         })
+    }
+
+    #[cfg(feature = "local")]
+    pub(crate) fn from_config_local(
+        cfg: Config,
+        local: Option<crate::local::LocalConfig>,
+    ) -> Result<Self> {
+        let mut c = Client::from_config(cfg)?;
+        let handle = crate::local::LocalHandle::new(c.clone(), local.unwrap_or_default())?;
+        c.local = Some(Arc::new(handle));
+        Ok(c)
     }
 
     /// The API key in use: its organization, mode and scopes (`GET /v1/key`).
@@ -95,17 +124,20 @@ impl Client {
         Ok(self.key().await?.org_id)
     }
 
-    /// The server's X25519 public key for sealed content (cached after the first call).
+    /// The server's X25519 public key for sealed content. Cached for an hour
+    /// (the server may rotate it), and dropped at once when the API can't
+    /// decrypt a sealed job.
     pub async fn server_key(&self) -> Result<[u8; 32]> {
         if let Some(k) = self.cfg.cached_server_key() {
             return Ok(k);
         }
+        let gen = self.cfg.server_key_gen();
         let v = self
             .send(Request::get("/v1/public/server-key").public())
             .await?;
         let b64: String = field(v, "public_key")?;
         let k = seal::decode_public_key(&b64)?;
-        self.cfg.set_server_key(k);
+        self.cfg.set_server_key(k, gen);
         Ok(k)
     }
 
@@ -140,14 +172,21 @@ impl Client {
     }
 
     async fn send_to(&self, req: &Request, url: &str) -> Result<Value> {
+        if req.auth && self.cfg.api_key.is_empty() {
+            return Err(crate::core::missing_api_key());
+        }
         let mut attempt = 0;
         loop {
             let mut rb = match req.method {
                 Method::Get => self.http.get(url),
                 Method::Post => self.http.post(url),
+                Method::Delete => self.http.delete(url),
             }
             .header(ACCEPT, "application/json")
             .header(UA, USER_AGENT);
+            if let Some(t) = req.timeout {
+                rb = rb.timeout(t);
+            }
             if !req.query.is_empty() {
                 rb = rb.query(&req.query);
             }
@@ -157,6 +196,8 @@ impl Client {
             if let Some(b) = &req.body {
                 rb = rb.json(b);
             }
+            // Whether a failed attempt may have reached the API.
+            let mut maybe_sent = false;
             let outcome = match rb.send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
@@ -172,20 +213,27 @@ impl Client {
                             body,
                         },
                         Ok(None) => Attempt::TooLarge,
-                        Err(e) => Attempt::Network {
-                            message: e.to_string(),
-                            timeout: e.is_timeout(),
-                        },
+                        Err(e) => {
+                            maybe_sent = true;
+                            Attempt::Network {
+                                message: e.to_string(),
+                                timeout: e.is_timeout(),
+                            }
+                        }
                     }
                 }
-                Err(e) => Attempt::Network {
-                    message: e.to_string(),
-                    timeout: e.is_timeout(),
-                },
+                Err(e) => {
+                    maybe_sent = !e.is_connect();
+                    Attempt::Network {
+                        message: e.to_string(),
+                        timeout: e.is_timeout(),
+                    }
+                }
             };
             match decide(&self.cfg, req, attempt, outcome) {
                 Step::Done(r) => return r,
                 Step::Retry(wait) => {
+                    req.note_retry(maybe_sent);
                     tokio::time::sleep(wait).await;
                     attempt += 1;
                 }
@@ -205,20 +253,196 @@ impl<'a> Jobs<'a> {
     ///
     /// An idempotency key is generated when you don't set one, so the request
     /// is retried safely; repeating a key returns the first job.
+    ///
+    /// With [`ClientBuilder::local`] in a mode other than
+    /// [`LocalMode::Cloud`](crate::LocalMode::Cloud), the job goes to a
+    /// station on the local network and/or the cloud as the mode says;
+    /// [`Job::via`] tells which one took it. The fallback modes use the same
+    /// idempotency key (`"sdk-<uuid v4>"` when you set none) for both, so a
+    /// fallback never prints twice.
     pub async fn create(&self, params: CreateJob) -> Result<Job> {
-        let params = with_idempotency(params);
+        #[cfg(feature = "local")]
+        if let Some(l) = self.client.local_state() {
+            if l.mode() != crate::LocalMode::Cloud {
+                return crate::local::create(self.client, l, params).await;
+            }
+        }
+        self.create_cloud(with_idempotency(params)?, None).await
+    }
+
+    /// The JSON body of a cloud job (sealed when asked).
+    async fn cloud_body(&self, params: &CreateJob) -> Result<Value> {
         let key = if params.sealed {
             Some(self.client.server_key().await?)
         } else {
             None
         };
         let sealer = key.map(|k| move |m: &[u8]| seal::seal(&k, m));
-        let body = params.to_body(sealer.as_ref().map(|f| f as Sealer<'_>))?;
-        let v = self
-            .client
-            .send(Request::post("/v1/orgs/{org}/jobs", body).idempotent())
-            .await?;
-        field(v, "job")
+        params.to_body(sealer.as_ref().map(|f| f as Sealer<'_>))
+    }
+
+    /// Sends a job to the cloud. `once_within`: try once within this
+    /// timeout instead of the client's retry policy.
+    pub(crate) async fn create_cloud(
+        &self,
+        params: CreateJob,
+        once_within: Option<std::time::Duration>,
+    ) -> Result<Job> {
+        let mut st = CloudModeCreate::new(
+            params.sealed,
+            &self.client.cfg.base_url,
+            params.idempotency_key.as_deref().unwrap_or_default(),
+        );
+        let amb = st.ambiguous.clone();
+        let request = move |body: Value| {
+            #[allow(unused_mut)]
+            let mut req = Request::post("/v1/orgs/{org}/jobs", body)
+                .idempotent()
+                .track_ambiguous(amb.clone());
+            #[cfg(feature = "local")]
+            if let Some(t) = once_within {
+                req = req.once_within(t);
+            }
+            req
+        };
+        #[cfg(not(feature = "local"))]
+        let _ = once_within;
+        // Built (and sealed) once: retries and re-sends send the same bytes.
+        let mut req = request(self.cloud_body(&params).await?);
+        let v = loop {
+            let err = match self.client.send(req.clone()).await {
+                Ok(v) => break v,
+                Err(e) => e,
+            };
+            match st.after(err) {
+                CloudNext::Resend => tokio::time::sleep(DUPLICATE_PAUSE).await,
+                CloudNext::Reseal(first) => {
+                    // The API couldn't decrypt the sealed content (key
+                    // rotated): fetch the key again, seal again, re-send once
+                    // with the same idempotency key (S1).
+                    self.client.cfg.drop_server_key();
+                    match self.cloud_body(&params).await {
+                        Ok(b) => req = request(b),
+                        Err(fe) => return Err(st.key_fetch_failed(first, fe)),
+                    }
+                }
+                CloudNext::Fail(e) => return Err(e),
+            }
+        };
+        let mut job: Job = field(v, "job")?;
+        job.via = Some(crate::models::Via::Cloud);
+        Ok(job)
+    }
+
+    /// One cloud create for the local modes, classified like a station
+    /// attempt: answered, certainly not delivered, or delivered without an
+    /// answer (the cloud may have queued it). `timeout` bounds the whole
+    /// attempt, the organization lookup included.
+    /// The serialized (and sealed) body of a cloud job, built once per
+    /// create so retries and re-sends carry the exact same bytes. Fails
+    /// before anything is sent: a server-key fetch that fails is
+    /// "not delivered" for the caller.
+    #[cfg(feature = "local")]
+    pub(crate) async fn cloud_job_bytes(&self, params: &CreateJob) -> Result<bytes::Bytes> {
+        let v = self.cloud_body(params).await?;
+        serde_json::to_vec(&v)
+            .map(bytes::Bytes::from)
+            .map_err(|e| Error::Decode(e.to_string()))
+    }
+
+    #[cfg(feature = "local")]
+    pub(crate) async fn create_cloud_once(
+        &self,
+        body: &bytes::Bytes,
+        timeout: Option<std::time::Duration>,
+    ) -> CloudAttempt {
+        use crate::local::transport::tracked_bytes;
+        use std::sync::atomic::Ordering;
+        let c = self.client;
+        if c.cfg.api_key.is_empty() {
+            return CloudAttempt::Answered(Err(crate::core::missing_api_key()));
+        }
+        let started = Instant::now();
+        let org = match timeout {
+            Some(t) => match tokio::time::timeout(t, c.org_id()).await {
+                Ok(r) => r,
+                Err(_) => Err(Error::Connection {
+                    message: format!("the CatzPrint API didn't answer within {t:?}"),
+                    timeout: true,
+                }),
+            },
+            None => c.org_id().await,
+        };
+        let org = match org {
+            Ok(o) => o,
+            // The job wasn't sent: the organization lookup failed.
+            Err(e @ (Error::Connection { .. } | Error::Server(_))) => {
+                return CloudAttempt::NotDelivered(e)
+            }
+            Err(e) => return CloudAttempt::Answered(Err(e)),
+        };
+        let url = format!("{}/v1/orgs/{}/jobs", c.cfg.base_url, seg(&org));
+        let (tracked, taken) = tracked_bytes(body.clone());
+        let mut rb = c
+            .http
+            .post(&url)
+            .header(ACCEPT, "application/json")
+            .header(UA, USER_AGENT)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .bearer_auth(&c.cfg.api_key)
+            .body(tracked);
+        if let Some(t) = timeout {
+            rb = rb.timeout(
+                t.saturating_sub(started.elapsed())
+                    .max(std::time::Duration::from_millis(1)),
+            );
+        }
+        let net = |e: reqwest::Error| Error::Connection {
+            message: e.to_string(),
+            timeout: e.is_timeout(),
+        };
+        let resp = match rb.send().await {
+            Ok(r) => r,
+            Err(e) if taken.load(Ordering::SeqCst) => return CloudAttempt::Ambiguous(net(e)),
+            Err(e) => return CloudAttempt::NotDelivered(net(e)),
+        };
+        let status = resp.status().as_u16();
+        let retry_after = parse_retry_after(
+            resp.headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+        );
+        let body = match read_limited(resp).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                return CloudAttempt::Ambiguous(Error::Decode(format!(
+                    "the API response is larger than {MAX_RESPONSE_BYTES} bytes"
+                )))
+            }
+            Err(e) => return CloudAttempt::Ambiguous(net(e)),
+        };
+        if (200..300).contains(&status) {
+            let job = serde_json::from_slice::<Value>(&body)
+                .map_err(|e| Error::Decode(e.to_string()))
+                .and_then(|v| field::<Job>(v, "job"));
+            return match job {
+                Ok(job) if job.id.is_empty() => CloudAttempt::Ambiguous(Error::Decode(
+                    "the API accepted the job but its answer has no job id".into(),
+                )),
+                Ok(mut job) => {
+                    job.via = Some(crate::models::Via::Cloud);
+                    CloudAttempt::Answered(Ok(Box::new(job)))
+                }
+                Err(e) => CloudAttempt::Ambiguous(e),
+            };
+        }
+        let err = crate::error::map_error(status, retry_after, &body);
+        match status {
+            502..=504 => CloudAttempt::NotDelivered(err),
+            // Any other 5xx (and a redirect): the cloud may have the job.
+            500..=599 | 300..=399 => CloudAttempt::Ambiguous(err),
+            _ => CloudAttempt::Answered(Err(err)),
+        }
     }
 
     /// Prints plain text. `opts` sets the destination and other fields.
@@ -278,13 +502,22 @@ impl<'a> Jobs<'a> {
         .await
     }
 
-    /// Gets a job, with its status history in `events`.
+    /// Gets a job, with its status history in `events`. Local job IDs
+    /// (`"lj_…"`, from a job a station took) are read from the station.
     pub async fn get(&self, id: &str) -> Result<Job> {
-        job_with_events(
+        #[cfg(feature = "local")]
+        if id.starts_with("lj_") {
+            if let Some(l) = self.client.local_state() {
+                return crate::local::get_job(l, id).await;
+            }
+        }
+        let mut job = job_with_events(
             self.client
                 .send(Request::get(format!("/v1/orgs/{{org}}/jobs/{}", seg(id))))
                 .await?,
-        )
+        )?;
+        job.via = Some(crate::models::Via::Cloud);
+        Ok(job)
     }
 
     /// Lists one page of jobs, newest first. Use `next_cursor` for the next page,
